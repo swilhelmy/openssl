@@ -1,5 +1,5 @@
 /*
- * Copyright 2008-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2008-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -21,7 +21,6 @@
 typedef struct CMS_IssuerAndSerialNumber_st CMS_IssuerAndSerialNumber;
 typedef struct CMS_EncapsulatedContentInfo_st CMS_EncapsulatedContentInfo;
 typedef struct CMS_SignerIdentifier_st CMS_SignerIdentifier;
-typedef struct CMS_SignedData_st CMS_SignedData;
 typedef struct CMS_OtherRevocationInfoFormat_st CMS_OtherRevocationInfoFormat;
 typedef struct CMS_OriginatorInfo_st CMS_OriginatorInfo;
 typedef struct CMS_EncryptedContentInfo_st CMS_EncryptedContentInfo;
@@ -367,6 +366,7 @@ struct CMS_Receipt_st {
 
 DECLARE_ASN1_FUNCTIONS(CMS_ContentInfo)
 DECLARE_ASN1_ITEM(CMS_SignerInfo)
+DECLARE_ASN1_ITEM(CMS_EncryptedContentInfo)
 DECLARE_ASN1_ITEM(CMS_IssuerAndSerialNumber)
 DECLARE_ASN1_ITEM(CMS_Attributes_Sign)
 DECLARE_ASN1_ITEM(CMS_Attributes_Verify)

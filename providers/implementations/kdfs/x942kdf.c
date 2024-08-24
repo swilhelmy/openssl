@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -17,6 +17,7 @@
 #include <openssl/proverr.h>
 #include "internal/packet.h"
 #include "internal/der.h"
+#include "internal/nelem.h"
 #include "prov/provider_ctx.h"
 #include "prov/providercommon.h"
 #include "prov/implementations.h"
@@ -238,7 +239,7 @@ x942_encode_otherinfo(size_t keylen,
         goto err;
     /*
      * Since we allocated the exact size required, the buffer should point to the
-     * start of the alllocated buffer at this point.
+     * start of the allocated buffer at this point.
      */
     if (WPACKET_get_curr(&pkt) != der_buf)
         goto err;
@@ -335,10 +336,8 @@ static void *x942kdf_new(void *provctx)
     if (!ossl_prov_is_running())
         return NULL;
 
-    if ((ctx = OPENSSL_zalloc(sizeof(*ctx))) == NULL) {
-        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+    if ((ctx = OPENSSL_zalloc(sizeof(*ctx))) == NULL)
         return NULL;
-    }
     ctx->provctx = provctx;
     ctx->use_keybits = 1;
     return ctx;
@@ -508,12 +507,21 @@ static int x942kdf_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     KDF_X942 *ctx = vctx;
     OSSL_LIB_CTX *provctx = PROV_LIBCTX_OF(ctx->provctx);
     const char *propq = NULL;
+    const EVP_MD *md;
     size_t id;
 
     if (params == NULL)
         return 1;
-    if (!ossl_prov_digest_load_from_params(&ctx->digest, params, provctx))
-        return 0;
+
+    if (OSSL_PARAM_locate_const(params, OSSL_ALG_PARAM_DIGEST) != NULL) {
+        if (!ossl_prov_digest_load_from_params(&ctx->digest, params, provctx))
+            return 0;
+        md = ossl_prov_digest_md(&ctx->digest);
+        if ((EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
+            ERR_raise(ERR_LIB_PROV, PROV_R_XOF_DIGESTS_NOT_ALLOWED);
+            return 0;
+        }
+    }
 
     p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_SECRET);
     if (p == NULL)
@@ -627,5 +635,5 @@ const OSSL_DISPATCH ossl_kdf_x942_kdf_functions[] = {
     { OSSL_FUNC_KDF_GETTABLE_CTX_PARAMS,
       (void(*)(void))x942kdf_gettable_ctx_params },
     { OSSL_FUNC_KDF_GET_CTX_PARAMS, (void(*)(void))x942kdf_get_ctx_params },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };

@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -25,10 +25,12 @@
 #include "internal/nelem.h"
 #include "internal/sizes.h"
 #include "internal/cryptlib.h"
+#include "internal/deterministic_nonce.h"
 #include "prov/providercommon.h"
 #include "prov/implementations.h"
 #include "prov/provider_ctx.h"
 #include "prov/securitycheck.h"
+#include "prov/fipsindicator.h"
 #include "crypto/ec.h"
 #include "prov/der_ec.h"
 
@@ -102,6 +104,17 @@ typedef struct {
      */
     unsigned int kattest;
 #endif
+#ifdef FIPS_MODULE
+    /*
+     * FIPS 140-3 IG 2.4.B mandates that verification based on a digest of a
+     * message is not permitted.  However, signing based on a digest is still
+     * permitted.
+     */
+    int verify_message;
+#endif
+    /* If this is set then the generated k is not random */
+    unsigned int nonce_type;
+    OSSL_FIPS_IND_DECLARE
 } PROV_ECDSA_CTX;
 
 static void *ecdsa_newctx(void *provctx, const char *propq)
@@ -115,21 +128,23 @@ static void *ecdsa_newctx(void *provctx, const char *propq)
     if (ctx == NULL)
         return NULL;
 
+    OSSL_FIPS_IND_INIT(ctx)
     ctx->flag_allow_md = 1;
+#ifdef FIPS_MODULE
+    ctx->verify_message = 1;
+#endif
     ctx->libctx = PROV_LIBCTX_OF(provctx);
     if (propq != NULL && (ctx->propq = OPENSSL_strdup(propq)) == NULL) {
         OPENSSL_free(ctx);
         ctx = NULL;
-        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
     }
     return ctx;
 }
 
-static int ecdsa_signverify_init(void *vctx, void *ec,
-                                 const OSSL_PARAM params[], int operation)
+static int ecdsa_signverify_init(PROV_ECDSA_CTX *ctx, void *ec,
+                                 const OSSL_PARAM params[], int operation,
+                                 const char *desc)
 {
-    PROV_ECDSA_CTX *ctx = (PROV_ECDSA_CTX *)vctx;
-
     if (!ossl_prov_is_running()
             || ctx == NULL)
         return 0;
@@ -140,8 +155,6 @@ static int ecdsa_signverify_init(void *vctx, void *ec,
     }
 
     if (ec != NULL) {
-        if (!ossl_ec_check_key(ctx->libctx, ec, operation == EVP_PKEY_OP_SIGN))
-            return 0;
         if (!EC_KEY_up_ref(ec))
             return 0;
         EC_KEY_free(ctx->ec);
@@ -150,20 +163,39 @@ static int ecdsa_signverify_init(void *vctx, void *ec,
 
     ctx->operation = operation;
 
+    OSSL_FIPS_IND_SET_APPROVED(ctx)
     if (!ecdsa_set_ctx_params(ctx, params))
         return 0;
-
+#ifdef FIPS_MODULE
+    if (!ossl_fips_ind_ec_key_check(OSSL_FIPS_IND_GET(ctx),
+                                    OSSL_FIPS_IND_SETTABLE0, ctx->libctx,
+                                    EC_KEY_get0_group(ctx->ec), desc,
+                                    operation == EVP_PKEY_OP_SIGN))
+        return 0;
+#endif
     return 1;
 }
 
 static int ecdsa_sign_init(void *vctx, void *ec, const OSSL_PARAM params[])
 {
-    return ecdsa_signverify_init(vctx, ec, params, EVP_PKEY_OP_SIGN);
+    PROV_ECDSA_CTX *ctx = (PROV_ECDSA_CTX *)vctx;
+
+#ifdef FIPS_MODULE
+    ctx->verify_message = 1;
+#endif
+    return ecdsa_signverify_init(ctx, ec, params, EVP_PKEY_OP_SIGN,
+                                 "ECDSA Sign Init");
 }
 
 static int ecdsa_verify_init(void *vctx, void *ec, const OSSL_PARAM params[])
 {
-    return ecdsa_signverify_init(vctx, ec, params, EVP_PKEY_OP_VERIFY);
+    PROV_ECDSA_CTX *ctx = (PROV_ECDSA_CTX *)vctx;
+
+#ifdef FIPS_MODULE
+    ctx->verify_message = 0;
+#endif
+    return ecdsa_signverify_init(ctx, ec, params, EVP_PKEY_OP_VERIFY,
+                                 "ECDSA Verify Init");
 }
 
 static int ecdsa_sign(void *vctx, unsigned char *sig, size_t *siglen,
@@ -193,7 +225,15 @@ static int ecdsa_sign(void *vctx, unsigned char *sig, size_t *siglen,
     if (ctx->mdsize != 0 && tbslen != ctx->mdsize)
         return 0;
 
-    ret = ECDSA_sign_ex(0, tbs, tbslen, sig, &sltmp, ctx->kinv, ctx->r, ctx->ec);
+    if (ctx->nonce_type != 0) {
+        ret = ossl_ecdsa_deterministic_sign(tbs, tbslen, sig, &sltmp,
+                                            ctx->ec, ctx->nonce_type,
+                                            ctx->mdname,
+                                            ctx->libctx, ctx->propq);
+    } else {
+        ret = ECDSA_sign_ex(0, tbs, tbslen, sig, &sltmp, ctx->kinv, ctx->r,
+                            ctx->ec);
+    }
     if (ret <= 0)
         return 0;
 
@@ -213,11 +253,11 @@ static int ecdsa_verify(void *vctx, const unsigned char *sig, size_t siglen,
 }
 
 static int ecdsa_setup_md(PROV_ECDSA_CTX *ctx, const char *mdname,
-                          const char *mdprops)
+                          const char *mdprops, const char *desc)
 {
     EVP_MD *md = NULL;
     size_t mdname_len;
-    int md_nid, sha1_allowed;
+    int md_nid, md_size;
     WPACKET pkt;
 
     if (mdname == NULL)
@@ -237,22 +277,41 @@ static int ecdsa_setup_md(PROV_ECDSA_CTX *ctx, const char *mdname,
                        "%s could not be fetched", mdname);
         return 0;
     }
-    sha1_allowed = (ctx->operation != EVP_PKEY_OP_SIGN);
-    md_nid = ossl_digest_get_approved_nid_with_sha1(ctx->libctx, md,
-                                                    sha1_allowed);
+    md_size = EVP_MD_get_size(md);
+    if (md_size <= 0) {
+        ERR_raise_data(ERR_LIB_PROV, PROV_R_INVALID_DIGEST,
+                       "%s has invalid md size %d", mdname, md_size);
+        goto err;
+    }
+    md_nid = ossl_digest_get_approved_nid(md);
     if (md_nid < 0) {
         ERR_raise_data(ERR_LIB_PROV, PROV_R_DIGEST_NOT_ALLOWED,
                        "digest=%s", mdname);
-        EVP_MD_free(md);
-        return 0;
+        goto err;
     }
+    /* XOF digests don't work */
+    if ((EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
+        ERR_raise(ERR_LIB_PROV, PROV_R_XOF_DIGESTS_NOT_ALLOWED);
+        goto err;
+    }
+
+#ifdef FIPS_MODULE
+    {
+        int sha1_allowed = (ctx->operation != EVP_PKEY_OP_SIGN);
+
+        if (!ossl_fips_ind_digest_sign_check(OSSL_FIPS_IND_GET(ctx),
+                                             OSSL_FIPS_IND_SETTABLE1, ctx->libctx,
+                                             md_nid, sha1_allowed, desc,
+                                             &FIPS_fips_signature_digest_check))
+            goto err;
+    }
+#endif
 
     if (!ctx->flag_allow_md) {
         if (ctx->mdname[0] != '\0' && !EVP_MD_is_a(md, ctx->mdname)) {
             ERR_raise_data(ERR_LIB_PROV, PROV_R_DIGEST_NOT_ALLOWED,
                            "digest %s != %s", mdname, ctx->mdname);
-            EVP_MD_free(md);
-            return 0;
+            goto err;
         }
         EVP_MD_free(md);
         return 1;
@@ -272,23 +331,29 @@ static int ecdsa_setup_md(PROV_ECDSA_CTX *ctx, const char *mdname,
     WPACKET_cleanup(&pkt);
     ctx->mdctx = NULL;
     ctx->md = md;
-    ctx->mdsize = EVP_MD_get_size(ctx->md);
+    ctx->mdsize = (size_t)md_size;
     OPENSSL_strlcpy(ctx->mdname, mdname, sizeof(ctx->mdname));
 
     return 1;
+err:
+    EVP_MD_free(md);
+    return 0;
 }
 
 static int ecdsa_digest_signverify_init(void *vctx, const char *mdname,
                                         void *ec, const OSSL_PARAM params[],
-                                        int operation)
+                                        int operation, const char *desc)
 {
     PROV_ECDSA_CTX *ctx = (PROV_ECDSA_CTX *)vctx;
 
     if (!ossl_prov_is_running())
         return 0;
 
-    if (!ecdsa_signverify_init(vctx, ec, params, operation)
-        || !ecdsa_setup_md(ctx, mdname, NULL))
+#ifdef FIPS_MODULE
+    ctx->verify_message = 1;
+#endif
+    if (!ecdsa_signverify_init(ctx, ec, params, operation, desc)
+        || !ecdsa_setup_md(ctx, mdname, NULL, desc))
         return 0;
 
     ctx->flag_allow_md = 0;
@@ -312,14 +377,16 @@ static int ecdsa_digest_sign_init(void *vctx, const char *mdname, void *ec,
                                   const OSSL_PARAM params[])
 {
     return ecdsa_digest_signverify_init(vctx, mdname, ec, params,
-                                        EVP_PKEY_OP_SIGN);
+                                        EVP_PKEY_OP_SIGN,
+                                        "ECDSA Digest Sign Init");
 }
 
 static int ecdsa_digest_verify_init(void *vctx, const char *mdname, void *ec,
                                     const OSSL_PARAM params[])
 {
     return ecdsa_digest_signverify_init(vctx, mdname, ec, params,
-                                        EVP_PKEY_OP_VERIFY);
+                                        EVP_PKEY_OP_VERIFY,
+                                        "ECDSA Digest Verify Init");
 }
 
 int ecdsa_digest_signverify_update(void *vctx, const unsigned char *data,
@@ -457,6 +524,18 @@ static int ecdsa_get_ctx_params(void *vctx, OSSL_PARAM *params)
                                                     : EVP_MD_get0_name(ctx->md)))
         return 0;
 
+    p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_NONCE_TYPE);
+    if (p != NULL && !OSSL_PARAM_set_uint(p, ctx->nonce_type))
+        return 0;
+
+#ifdef FIPS_MODULE
+    p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_FIPS_VERIFY_MESSAGE);
+    if (p != NULL && !OSSL_PARAM_set_uint(p, ctx->verify_message))
+        return 0;
+#endif
+
+    if (!OSSL_FIPS_IND_GET_CTX_PARAM(ctx, params))
+        return 0;
     return 1;
 }
 
@@ -464,6 +543,11 @@ static const OSSL_PARAM known_gettable_ctx_params[] = {
     OSSL_PARAM_octet_string(OSSL_SIGNATURE_PARAM_ALGORITHM_ID, NULL, 0),
     OSSL_PARAM_size_t(OSSL_SIGNATURE_PARAM_DIGEST_SIZE, NULL),
     OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
+    OSSL_PARAM_uint(OSSL_SIGNATURE_PARAM_NONCE_TYPE, NULL),
+#ifdef FIPS_MODULE
+    OSSL_PARAM_uint(OSSL_SIGNATURE_PARAM_FIPS_VERIFY_MESSAGE, NULL),
+#endif
+    OSSL_FIPS_IND_GETTABLE_CTX_PARAM()
     OSSL_PARAM_END
 };
 
@@ -484,6 +568,13 @@ static int ecdsa_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     if (params == NULL)
         return 1;
 
+    if (!OSSL_FIPS_IND_SET_CTX_PARAM(ctx, OSSL_FIPS_IND_SETTABLE0, params,
+                                     OSSL_SIGNATURE_PARAM_FIPS_KEY_CHECK))
+        return 0;
+    if (!OSSL_FIPS_IND_SET_CTX_PARAM(ctx, OSSL_FIPS_IND_SETTABLE1, params,
+                                     OSSL_SIGNATURE_PARAM_FIPS_DIGEST_CHECK))
+        return 0;
+
 #if !defined(OPENSSL_NO_ACVP_TESTS)
     p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_KAT);
     if (p != NULL && !OSSL_PARAM_get_uint(p, &ctx->kattest))
@@ -503,7 +594,7 @@ static int ecdsa_set_ctx_params(void *vctx, const OSSL_PARAM params[])
         if (propsp != NULL
             && !OSSL_PARAM_get_utf8_string(propsp, &pmdprops, sizeof(mdprops)))
             return 0;
-        if (!ecdsa_setup_md(ctx, mdname, mdprops))
+        if (!ecdsa_setup_md(ctx, mdname, mdprops, "ECDSA Set Ctx"))
             return 0;
     }
 
@@ -514,7 +605,10 @@ static int ecdsa_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             return 0;
         ctx->mdsize = mdsize;
     }
-
+    p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_NONCE_TYPE);
+    if (p != NULL
+        && !OSSL_PARAM_get_uint(p, &ctx->nonce_type))
+        return 0;
     return 1;
 }
 
@@ -523,6 +617,9 @@ static const OSSL_PARAM settable_ctx_params[] = {
     OSSL_PARAM_size_t(OSSL_SIGNATURE_PARAM_DIGEST_SIZE, NULL),
     OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_PROPERTIES, NULL, 0),
     OSSL_PARAM_uint(OSSL_SIGNATURE_PARAM_KAT, NULL),
+    OSSL_PARAM_uint(OSSL_SIGNATURE_PARAM_NONCE_TYPE, NULL),
+    OSSL_FIPS_IND_SETTABLE_CTX_PARAM(OSSL_SIGNATURE_PARAM_FIPS_KEY_CHECK)
+    OSSL_FIPS_IND_SETTABLE_CTX_PARAM(OSSL_SIGNATURE_PARAM_FIPS_DIGEST_CHECK)
     OSSL_PARAM_END
 };
 
@@ -615,5 +712,5 @@ const OSSL_DISPATCH ossl_ecdsa_signature_functions[] = {
       (void (*)(void))ecdsa_set_ctx_md_params },
     { OSSL_FUNC_SIGNATURE_SETTABLE_CTX_MD_PARAMS,
       (void (*)(void))ecdsa_settable_ctx_md_params },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };

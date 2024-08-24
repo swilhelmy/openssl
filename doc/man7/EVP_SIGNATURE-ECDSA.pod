@@ -21,6 +21,12 @@ and before calling EVP_PKEY_sign() or EVP_PKEY_verify().
 
 =item "properties" (B<OSSL_SIGNATURE_PARAM_PROPERTIES>) <UTF8 string>
 
+=item "nonce-type" (B<OSSL_SIGNATURE_PARAM_NONCE_TYPE>) <unsigned integer>
+
+=item "key-check" (B<OSSL_SIGNATURE_PARAM_FIPS_KEY_CHECK>) <integer>
+
+=item "digest-check" (B<OSSL_SIGNATURE_PARAM_FIPS_DIGEST_CHECK>) <integer>
+
 These parameters are described in L<provider-signature(7)>.
 
 =back
@@ -33,6 +39,12 @@ EVP_PKEY_CTX_get_params().
 =item "algorithm-id" (B<OSSL_SIGNATURE_PARAM_ALGORITHM_ID>) <octet string>
 
 =item "digest" (B<OSSL_SIGNATURE_PARAM_DIGEST>) <UTF8 string>
+
+=item "nonce-type" (B<OSSL_SIGNATURE_PARAM_NONCE_TYPE>) <unsigned integer>
+
+=item "fips-indicator" (B<OSSL_SIGNATURE_PARAM_FIPS_APPROVED_INDICATOR>) <integer>
+
+=item "verify-message" (B<OSSL_SIGNATURE_PARAM_FIPS_VERIFY_MESSAGE> <integer>
 
 The parameters are described in L<provider-signature(7)>.
 
@@ -47,7 +59,7 @@ L<provider-signature(7)>,
 
 =head1 COPYRIGHT
 
-Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
+Copyright 2020-2023 The OpenSSL Project Authors. All Rights Reserved.
 
 Licensed under the Apache License 2.0 (the "License").  You may not use
 this file except in compliance with the License.  You can obtain a copy

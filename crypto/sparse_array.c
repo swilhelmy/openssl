@@ -19,7 +19,7 @@
  * depth of the tree but potentially wastes more memory.  That is, this is a
  * direct space versus time tradeoff.
  *
- * The default is to use four bits which means that the are 16
+ * The default is to use four bits which means that there are 16
  * pointers in each tree node.
  *
  * The library builder is also permitted to define other sizes in the closed
@@ -109,8 +109,10 @@ static void sa_free_leaf(ossl_uintmax_t n, void *p, void *arg)
 
 void ossl_sa_free(OPENSSL_SA *sa)
 {
-    sa_doall(sa, &sa_free_node, NULL, NULL);
-    OPENSSL_free(sa);
+    if (sa != NULL) {
+        sa_doall(sa, &sa_free_node, NULL, NULL);
+        OPENSSL_free(sa);
+    }
 }
 
 void ossl_sa_free_leaves(OPENSSL_SA *sa)

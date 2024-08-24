@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -22,20 +22,15 @@ static EVP_KEYEXCH *evp_keyexch_new(OSSL_PROVIDER *prov)
 {
     EVP_KEYEXCH *exchange = OPENSSL_zalloc(sizeof(EVP_KEYEXCH));
 
-    if (exchange == NULL) {
-        ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+    if (exchange == NULL)
         return NULL;
-    }
 
-    exchange->lock = CRYPTO_THREAD_lock_new();
-    if (exchange->lock == NULL) {
-        ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+    if (!CRYPTO_NEW_REF(&exchange->refcnt, 1)) {
         OPENSSL_free(exchange);
         return NULL;
     }
     exchange->prov = prov;
     ossl_provider_up_ref(prov);
-    exchange->refcnt = 1;
 
     return exchange;
 }
@@ -49,7 +44,7 @@ static void *evp_keyexch_from_algorithm(int name_id,
     int fncnt = 0, sparamfncnt = 0, gparamfncnt = 0;
 
     if ((exchange = evp_keyexch_new(prov)) == NULL) {
-        ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+        ERR_raise(ERR_LIB_EVP, ERR_R_EVP_LIB);
         goto err;
     }
 
@@ -150,12 +145,12 @@ void EVP_KEYEXCH_free(EVP_KEYEXCH *exchange)
 
     if (exchange == NULL)
         return;
-    CRYPTO_DOWN_REF(&exchange->refcnt, &i, exchange->lock);
+    CRYPTO_DOWN_REF(&exchange->refcnt, &i);
     if (i > 0)
         return;
     OPENSSL_free(exchange->type_name);
     ossl_provider_free(exchange->prov);
-    CRYPTO_THREAD_lock_free(exchange->lock);
+    CRYPTO_FREE_REF(&exchange->refcnt);
     OPENSSL_free(exchange);
 }
 
@@ -163,7 +158,7 @@ int EVP_KEYEXCH_up_ref(EVP_KEYEXCH *exchange)
 {
     int ref = 0;
 
-    CRYPTO_UP_REF(&exchange->refcnt, &ref, exchange->lock);
+    CRYPTO_UP_REF(&exchange->refcnt, &ref);
     return 1;
 }
 
@@ -556,7 +551,8 @@ const char *EVP_KEYEXCH_get0_description(const EVP_KEYEXCH *keyexch)
 
 int EVP_KEYEXCH_is_a(const EVP_KEYEXCH *keyexch, const char *name)
 {
-    return evp_is_a(keyexch->prov, keyexch->name_id, NULL, name);
+    return keyexch != NULL
+           && evp_is_a(keyexch->prov, keyexch->name_id, NULL, name);
 }
 
 void EVP_KEYEXCH_do_all_provided(OSSL_LIB_CTX *libctx,

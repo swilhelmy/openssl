@@ -1,5 +1,5 @@
 /*
- * Copyright 2020-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2020-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -98,6 +98,12 @@ static int sm2sig_set_mdname(PROV_SM2_CTX *psm2ctx, const char *mdname)
     if (psm2ctx->md == NULL)
         return 0;
 
+    /* XOF digests don't work */
+    if ((EVP_MD_get_flags(psm2ctx->md) & EVP_MD_FLAG_XOF) != 0) {
+        ERR_raise(ERR_LIB_PROV, PROV_R_XOF_DIGESTS_NOT_ALLOWED);
+        return 0;
+    }
+
     if (mdname == NULL)
         return 1;
 
@@ -122,7 +128,6 @@ static void *sm2sig_newctx(void *provctx, const char *propq)
     ctx->libctx = PROV_LIBCTX_OF(provctx);
     if (propq != NULL && (ctx->propq = OPENSSL_strdup(propq)) == NULL) {
         OPENSSL_free(ctx);
-        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
         return NULL;
     }
     ctx->mdsize = SM3_DIGEST_LENGTH;
@@ -311,10 +316,13 @@ int sm2sig_digest_verify_final(void *vpsm2ctx, const unsigned char *sig,
     PROV_SM2_CTX *psm2ctx = (PROV_SM2_CTX *)vpsm2ctx;
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int dlen = 0;
+    int md_size;
 
-    if (psm2ctx == NULL
-        || psm2ctx->mdctx == NULL
-        || EVP_MD_get_size(psm2ctx->md) > (int)sizeof(digest))
+    if (psm2ctx == NULL || psm2ctx->mdctx == NULL)
+        return 0;
+
+    md_size = EVP_MD_get_size(psm2ctx->md);
+    if (md_size <= 0 || md_size > (int)sizeof(digest))
         return 0;
 
     if (!(sm2sig_compute_z_digest(psm2ctx)
@@ -330,6 +338,7 @@ static void sm2sig_freectx(void *vpsm2ctx)
 
     free_md(ctx);
     EC_KEY_free(ctx->ec);
+    OPENSSL_free(ctx->propq);
     OPENSSL_free(ctx->id);
     OPENSSL_free(ctx);
 }
@@ -345,12 +354,20 @@ static void *sm2sig_dupctx(void *vpsm2ctx)
 
     *dstctx = *srcctx;
     dstctx->ec = NULL;
+    dstctx->propq = NULL;
     dstctx->md = NULL;
     dstctx->mdctx = NULL;
+    dstctx->id = NULL;
 
     if (srcctx->ec != NULL && !EC_KEY_up_ref(srcctx->ec))
         goto err;
     dstctx->ec = srcctx->ec;
+
+    if (srcctx->propq != NULL) {
+        dstctx->propq = OPENSSL_strdup(srcctx->propq);
+        if (dstctx->propq == NULL)
+            goto err;
+    }
 
     if (srcctx->md != NULL && !EVP_MD_up_ref(srcctx->md))
         goto err;
@@ -560,5 +577,5 @@ const OSSL_DISPATCH ossl_sm2_signature_functions[] = {
       (void (*)(void))sm2sig_set_ctx_md_params },
     { OSSL_FUNC_SIGNATURE_SETTABLE_CTX_MD_PARAMS,
       (void (*)(void))sm2sig_settable_ctx_md_params },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };

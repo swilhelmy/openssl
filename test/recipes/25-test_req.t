@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2015-2022 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2015-2024 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -15,7 +15,7 @@ use OpenSSL::Test qw/:DEFAULT srctop_file/;
 
 setup("test_req");
 
-plan tests => 92;
+plan tests => 110;
 
 require_ok(srctop_file('test', 'recipes', 'tconversion.pl'));
 
@@ -36,18 +36,27 @@ if (disabled("rsa")) {
 $ENV{MSYS2_ARG_CONV_EXCL} = "/CN=";
 
 # Check for duplicate -addext parameters, and one "working" case.
-my @addext_args = ( "openssl", "req", "-new", "-out", "testreq.pem",
+my @addext_args = ( "openssl", "req", "-new", "-out", "testreq-addexts.pem",
                     "-key",  srctop_file(@certs, "ee-key.pem"),
     "-config", srctop_file("test", "test.cnf"), @req_new );
 my $val = "subjectAltName=DNS:example.com";
+my $val1 = "subjectAltName=otherName:1.2.3.4;UTF8:test,email:info\@example.com";
 my $val2 = " " . $val;
 my $val3 = $val;
 $val3 =~ s/=/    =/;
 ok( run(app([@addext_args, "-addext", $val])));
+ok( run(app([@addext_args, "-addext", $val1])));
+$val1 =~ s/UTF8/XXXX/; # execute the error handling in do_othername
+ok(!run(app([@addext_args, "-addext", $val1])));
 ok(!run(app([@addext_args, "-addext", $val, "-addext", $val])));
 ok(!run(app([@addext_args, "-addext", $val, "-addext", $val2])));
 ok(!run(app([@addext_args, "-addext", $val, "-addext", $val3])));
 ok(!run(app([@addext_args, "-addext", $val2, "-addext", $val3])));
+ok(run(app([@addext_args, "-addext", "SXNetID=1:one, 2:two, 3:three"])));
+ok(run(app([@addext_args, "-addext", "subjectAltName=dirName:dirname_sec"])));
+
+ok(run(app([@addext_args, "-addext", "keyUsage=digitalSignature",
+           "-reqexts", "reqexts"]))); # referring to section in test.cnf
 
 # If a CSR is provided with neither of -key or -CA/-CAkey, this should fail.
 ok(!run(app(["openssl", "req", "-x509",
@@ -199,7 +208,7 @@ subtest "generating certificate requests with RSA-PSS" => sub {
         ok(!run(app(["openssl", "req",
                      "-config", srctop_file("test", "test.cnf"),
                      "-new", "-out", "testreq-rsapss3.pem", "-utf8",
-                     "-sigopt", "rsa_pss_saltlen:-4",
+                     "-sigopt", "rsa_pss_saltlen:-5",
                      "-key", srctop_file("test", "testrsapss.pem")])),
            "Generating request with expected failure");
 
@@ -264,7 +273,7 @@ subtest "generating certificate requests with Ed25519" => sub {
 
     SKIP: {
         skip "Ed25519 is not supported by this OpenSSL build", 2
-            if disabled("ec");
+            if disabled("ecx");
 
         ok(run(app(["openssl", "req",
                     "-config", srctop_file("test", "test.cnf"),
@@ -284,7 +293,7 @@ subtest "generating certificate requests with Ed448" => sub {
 
     SKIP: {
         skip "Ed448 is not supported by this OpenSSL build", 2
-            if disabled("ec");
+            if disabled("ecx");
 
         ok(run(app(["openssl", "req",
                     "-config", srctop_file("test", "test.cnf"),
@@ -393,16 +402,7 @@ sub generate_cert {
     push(@cmd, ("-CA", $ca_cert, "-CAkey", $ca_key)) unless $ss;
     ok(run(app([@cmd])), "generate $cert");
 }
-sub has_SKID {
-    my $cert = shift @_;
-    my $expect = shift @_;
-    cert_contains($cert, "Subject Key Identifier", $expect);
-}
-sub has_AKID {
-    my $cert = shift @_;
-    my $expect = shift @_;
-    cert_contains($cert, "Authority Key Identifier", $expect);
-}
+
 sub has_keyUsage {
     my $cert = shift @_;
     my $expect = shift @_;
@@ -424,6 +424,12 @@ my $SKID_AKID = "subjectKeyIdentifier,authorityKeyIdentifier";
 
 # # SKID
 
+my $cert = "self-signed_default_SKID_no_explicit_exts.pem";
+generate_cert($cert);
+has_version($cert, 3);
+has_SKID($cert, 1); # SKID added, though no explicit extensions given
+has_AKID($cert, 0);
+
 my $cert = "self-signed_v3_CA_hash_SKID.pem";
 generate_cert($cert, @v3_ca, "-addext", "subjectKeyIdentifier = hash");
 has_SKID($cert, 1); # explicit hash SKID
@@ -441,7 +447,8 @@ strict_verify($cert, 1);
 # AKID of self-signed certs
 
 $cert = "self-signed_v1_CA_no_KIDs.pem";
-generate_cert($cert);
+generate_cert($cert, "-x509v1");
+has_version($cert, 1);
 cert_ext_has_n_different_lines($cert, 0, $SKID_AKID); # no SKID and no AKID
 #TODO strict_verify($cert, 1); # self-signed v1 root cert should be accepted as CA
 
@@ -515,6 +522,8 @@ strict_verify($cert, 1);
 $cert = "self-issued_v3_CA_no_AKID.pem";
 generate_cert($cert, "-addext", "authorityKeyIdentifier = none",
     "-in", srctop_file(@certs, "x509-check.csr"));
+has_version($cert, 3);
+has_SKID($cert, 1); # SKID added, though no explicit extensions given
 has_AKID($cert, 0);
 strict_verify($cert, 1);
 
@@ -556,6 +565,11 @@ cert_ext_has_n_different_lines($cert, 6, $SKID_AKID); # SKID != AKID, both force
 
 # AKID of not self-issued certs
 
+$cert = "regular_v3_EE_default_KIDs_no_other_exts.pem";
+generate_cert($cert, "-key", srctop_file(@certs, "ee-key.pem"));
+has_version($cert, 3);
+cert_ext_has_n_different_lines($cert, 4, $SKID_AKID); # SKID != AKID
+
 $cert = "regular_v3_EE_default_KIDs.pem";
 generate_cert($cert, "-addext", "keyUsage = dataEncipherment",
     "-key", srctop_file(@certs, "ee-key.pem"));
@@ -585,3 +599,27 @@ $cert = "self-signed_CA_with_keyUsages.pem";
 generate_cert($cert, "-in", srctop_file(@certs, "ext-check.csr"),
     "-copy_extensions", "copy");
 has_keyUsage($cert, 1);
+
+# Generate cert using req with '-modulus'
+ok(run(app(["openssl", "req", "-x509", "-new", "-days", "365",
+            "-key", srctop_file("test", "testrsa.pem"),
+            "-config", srctop_file('test', 'test.cnf'),
+            "-out", "testreq-cert.pem",
+            "-modulus"])), "cert req creation - with -modulus");
+
+# Verify cert
+ok(run(app(["openssl", "x509", "-in", "testreq-cert.pem",
+            "-noout", "-text"])), "cert verification");
+
+# Generate cert with explicit start and end dates
+my %today = (strftime("%Y-%m-%d", gmtime) => 1);
+my $cert = "self-signed_explicit_date.pem";
+ok(run(app(["openssl", "req", "-x509", "-new", "-text",
+            "-config", srctop_file('test', 'test.cnf'),
+            "-key", srctop_file("test", "testrsa.pem"),
+            "-not_before", "today",
+            "-not_after", "today",
+            "-out", $cert]))
+&& ++$today{strftime("%Y-%m-%d", gmtime)}
+&& (grep { defined $today{$_} } get_not_before_date($cert))
+&& (grep { defined $today{$_} } get_not_after_date($cert)), "explicit start and end dates");

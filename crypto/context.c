@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -11,9 +11,11 @@
 #include <openssl/conf.h>
 #include "internal/thread_once.h"
 #include "internal/property.h"
+#include "internal/cryptlib.h"
 #include "internal/core.h"
 #include "internal/bio.h"
 #include "internal/provider.h"
+#include "crypto/decoder.h"
 #include "crypto/context.h"
 
 struct ossl_lib_ctx_st {
@@ -28,22 +30,30 @@ struct ossl_lib_ctx_st {
     void *global_properties;
     void *drbg;
     void *drbg_nonce;
+    CRYPTO_THREAD_LOCAL rcu_local_key;
 #ifndef FIPS_MODULE
     void *provider_conf;
     void *bio_core;
     void *child_provider;
     OSSL_METHOD_STORE *decoder_store;
+    void *decoder_cache;
     OSSL_METHOD_STORE *encoder_store;
     OSSL_METHOD_STORE *store_loader_store;
     void *self_test_cb;
+    void *indicator_cb;
+#endif
+#if defined(OPENSSL_THREADS)
+    void *threads;
 #endif
     void *rand_crngt;
 #ifdef FIPS_MODULE
     void *thread_event_handler;
     void *fips_prov;
 #endif
+    STACK_OF(SSL_COMP) *comp_methods;
 
-    unsigned int ischild:1;
+    int ischild;
+    int conf_diagnostics;
 };
 
 int ossl_lib_ctx_write_lock(OSSL_LIB_CTX *ctx)
@@ -76,9 +86,12 @@ static int context_init(OSSL_LIB_CTX *ctx)
 {
     int exdata_done = 0;
 
+    if (!CRYPTO_THREAD_init_local(&ctx->rcu_local_key, NULL))
+        return 0;
+
     ctx->lock = CRYPTO_THREAD_lock_new();
     if (ctx->lock == NULL)
-        return 0;
+        goto err;
 
     ctx->rand_crngt_lock = CRYPTO_THREAD_lock_new();
     if (ctx->rand_crngt_lock == NULL)
@@ -107,9 +120,15 @@ static int context_init(OSSL_LIB_CTX *ctx)
         goto err;
 
 #ifndef FIPS_MODULE
-    /* P2. We want decoder_store to be cleaned up before the provider store */
+    /*
+     * P2. We want decoder_store/decoder_cache to be cleaned up before the
+     * provider store
+     */
     ctx->decoder_store = ossl_method_store_new(ctx);
     if (ctx->decoder_store == NULL)
+        goto err;
+    ctx->decoder_cache = ossl_decoder_cache_new(ctx);
+    if (ctx->decoder_cache == NULL)
         goto err;
 
     /* P2. We want encoder_store to be cleaned up before the provider store */
@@ -159,6 +178,9 @@ static int context_init(OSSL_LIB_CTX *ctx)
     ctx->self_test_cb = ossl_self_test_set_callback_new(ctx);
     if (ctx->self_test_cb == NULL)
         goto err;
+    ctx->indicator_cb = ossl_indicator_set_callback_new(ctx);
+    if (ctx->indicator_cb == NULL)
+        goto err;
 #endif
 
 #ifdef FIPS_MODULE
@@ -168,6 +190,12 @@ static int context_init(OSSL_LIB_CTX *ctx)
 
     ctx->fips_prov = ossl_fips_prov_ossl_ctx_new(ctx);
     if (ctx->fips_prov == NULL)
+        goto err;
+#endif
+
+#ifndef OPENSSL_NO_THREAD_POOL
+    ctx->threads = ossl_threads_ctx_new(ctx);
+    if (ctx->threads == NULL)
         goto err;
 #endif
 
@@ -182,6 +210,10 @@ static int context_init(OSSL_LIB_CTX *ctx)
     if (!ossl_property_parse_init(ctx))
         goto err;
 
+#ifndef FIPS_MODULE
+    ctx->comp_methods = ossl_load_builtin_compressions();
+#endif
+
     return 1;
 
  err:
@@ -192,6 +224,7 @@ static int context_init(OSSL_LIB_CTX *ctx)
 
     CRYPTO_THREAD_lock_free(ctx->rand_crngt_lock);
     CRYPTO_THREAD_lock_free(ctx->lock);
+    CRYPTO_THREAD_cleanup_local(&ctx->rcu_local_key);
     memset(ctx, '\0', sizeof(*ctx));
     return 0;
 }
@@ -217,11 +250,19 @@ static void context_deinit_objs(OSSL_LIB_CTX *ctx)
         ctx->provider_conf = NULL;
     }
 
-    /* P2. We want decoder_store to be cleaned up before the provider store */
+    /*
+     * P2. We want decoder_store/decoder_cache to be cleaned up before the
+     * provider store
+     */
     if (ctx->decoder_store != NULL) {
         ossl_method_store_free(ctx->decoder_store);
         ctx->decoder_store = NULL;
     }
+    if (ctx->decoder_cache != NULL) {
+        ossl_decoder_cache_free(ctx->decoder_cache);
+        ctx->decoder_cache = NULL;
+    }
+
 
     /* P2. We want encoder_store to be cleaned up before the provider store */
     if (ctx->encoder_store != NULL) {
@@ -276,6 +317,11 @@ static void context_deinit_objs(OSSL_LIB_CTX *ctx)
     }
 
 #ifndef FIPS_MODULE
+    if (ctx->indicator_cb != NULL) {
+        ossl_indicator_set_callback_free(ctx->indicator_cb);
+        ctx->indicator_cb = NULL;
+    }
+
     if (ctx->self_test_cb != NULL) {
         ossl_self_test_set_callback_free(ctx->self_test_cb);
         ctx->self_test_cb = NULL;
@@ -299,6 +345,13 @@ static void context_deinit_objs(OSSL_LIB_CTX *ctx)
     }
 #endif
 
+#ifndef OPENSSL_NO_THREAD_POOL
+    if (ctx->threads != NULL) {
+        ossl_threads_ctx_free(ctx->threads);
+        ctx->threads = NULL;
+    }
+#endif
+
     /* Low priority. */
 #ifndef FIPS_MODULE
     if (ctx->child_provider != NULL) {
@@ -306,6 +359,14 @@ static void context_deinit_objs(OSSL_LIB_CTX *ctx)
         ctx->child_provider = NULL;
     }
 #endif
+
+#ifndef FIPS_MODULE
+    if (ctx->comp_methods != NULL) {
+        ossl_free_compression_methods_int(ctx->comp_methods);
+        ctx->comp_methods = NULL;
+    }
+#endif
+
 }
 
 static int context_deinit(OSSL_LIB_CTX *ctx)
@@ -323,6 +384,7 @@ static int context_deinit(OSSL_LIB_CTX *ctx)
     CRYPTO_THREAD_lock_free(ctx->lock);
     ctx->rand_crngt_lock = NULL;
     ctx->lock = NULL;
+    CRYPTO_THREAD_cleanup_local(&ctx->rcu_local_key);
     return 1;
 }
 
@@ -332,17 +394,32 @@ static OSSL_LIB_CTX default_context_int;
 
 static CRYPTO_ONCE default_context_init = CRYPTO_ONCE_STATIC_INIT;
 static CRYPTO_THREAD_LOCAL default_context_thread_local;
+static int default_context_inited = 0;
 
 DEFINE_RUN_ONCE_STATIC(default_context_do_init)
 {
-    return CRYPTO_THREAD_init_local(&default_context_thread_local, NULL)
-        && context_init(&default_context_int);
+    if (!CRYPTO_THREAD_init_local(&default_context_thread_local, NULL))
+        goto err;
+
+    if (!context_init(&default_context_int))
+        goto deinit_thread;
+
+    default_context_inited = 1;
+    return 1;
+
+deinit_thread:
+    CRYPTO_THREAD_cleanup_local(&default_context_thread_local);
+err:
+    return 0;
 }
 
 void ossl_lib_ctx_default_deinit(void)
 {
+    if (!default_context_inited)
+        return;
     context_deinit(&default_context_int);
     CRYPTO_THREAD_cleanup_local(&default_context_thread_local);
+    default_context_inited = 0;
 }
 
 static OSSL_LIB_CTX *get_thread_default_context(void)
@@ -424,7 +501,7 @@ int OSSL_LIB_CTX_load_config(OSSL_LIB_CTX *ctx, const char *config_file)
 
 void OSSL_LIB_CTX_free(OSSL_LIB_CTX *ctx)
 {
-    if (ossl_lib_ctx_is_default(ctx))
+    if (ctx == NULL || ossl_lib_ctx_is_default(ctx))
         return;
 
 #ifndef FIPS_MODULE
@@ -455,6 +532,15 @@ OSSL_LIB_CTX *OSSL_LIB_CTX_set0_default(OSSL_LIB_CTX *libctx)
     }
 
     return NULL;
+}
+
+void ossl_release_default_drbg_ctx(void)
+{
+    /* early release of the DRBG in global default libctx */
+    if (default_context_int.drbg != NULL) {
+        ossl_rand_ctx_free(default_context_int.drbg);
+        default_context_int.drbg = NULL;
+    }
 }
 #endif
 
@@ -519,12 +605,20 @@ void *ossl_lib_ctx_get_data(OSSL_LIB_CTX *ctx, int index)
         return ctx->child_provider;
     case OSSL_LIB_CTX_DECODER_STORE_INDEX:
         return ctx->decoder_store;
+    case OSSL_LIB_CTX_DECODER_CACHE_INDEX:
+        return ctx->decoder_cache;
     case OSSL_LIB_CTX_ENCODER_STORE_INDEX:
         return ctx->encoder_store;
     case OSSL_LIB_CTX_STORE_LOADER_STORE_INDEX:
         return ctx->store_loader_store;
     case OSSL_LIB_CTX_SELF_TEST_CB_INDEX:
         return ctx->self_test_cb;
+    case OSSL_LIB_CTX_INDICATOR_CB_INDEX:
+        return ctx->indicator_cb;
+#endif
+#ifndef OPENSSL_NO_THREAD_POOL
+    case OSSL_LIB_CTX_THREAD_INDEX:
+        return ctx->threads;
 #endif
 
     case OSSL_LIB_CTX_RAND_CRNGT_INDEX: {
@@ -565,9 +659,17 @@ void *ossl_lib_ctx_get_data(OSSL_LIB_CTX *ctx, int index)
         return ctx->fips_prov;
 #endif
 
+    case OSSL_LIB_CTX_COMP_METHODS:
+        return (void *)&ctx->comp_methods;
+
     default:
         return NULL;
     }
+}
+
+void *OSSL_LIB_CTX_get_data(OSSL_LIB_CTX *ctx, int index)
+{
+    return ossl_lib_ctx_get_data(ctx, index);
 }
 
 OSSL_EX_DATA_GLOBAL *ossl_lib_ctx_get_ex_data_global(OSSL_LIB_CTX *ctx)
@@ -589,4 +691,28 @@ const char *ossl_lib_ctx_get_descriptor(OSSL_LIB_CTX *libctx)
         return "Thread-local default library context";
     return "Non-default library context";
 #endif
+}
+
+CRYPTO_THREAD_LOCAL *ossl_lib_ctx_get_rcukey(OSSL_LIB_CTX *libctx)
+{
+    libctx = ossl_lib_ctx_get_concrete(libctx);
+    if (libctx == NULL)
+        return NULL;
+    return &libctx->rcu_local_key;
+}
+
+int OSSL_LIB_CTX_get_conf_diagnostics(OSSL_LIB_CTX *libctx)
+{
+    libctx = ossl_lib_ctx_get_concrete(libctx);
+    if (libctx == NULL)
+        return 0;
+    return libctx->conf_diagnostics;
+}
+
+void OSSL_LIB_CTX_set_conf_diagnostics(OSSL_LIB_CTX *libctx, int value)
+{
+    libctx = ossl_lib_ctx_get_concrete(libctx);
+    if (libctx == NULL)
+        return;
+    libctx->conf_diagnostics = value;
 }
